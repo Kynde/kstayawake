@@ -1,33 +1,46 @@
 #!/bin/bash
 #
-# kstayawake — temporarily stop KDE/PowerDevil from sleeping on idle or lid-close
-#              for N minutes, then restore normal behavior and (if the lid is
-#              still shut) suspend.
-#
-# Why this exists: lets a long job run with the lid closed without leaving the
-# machine awake forever. Entirely user-space — no sudo. It flips LidAction and
-# AutoSuspendAction to 0 (NoAction) in ~/.config/powerdevilrc for the AC and
-# Battery profiles, reloads PowerDevil over D-Bus, and runs the countdown in a
-# transient `systemd --user` unit. The LowBattery profile is left untouched, so
-# a dying unattended laptop still suspends.
-#
-# Usage:
-#   kstayawake N        arm / re-arm: no idle+lid sleep for N minutes. Re-running
-#                       resets the countdown to N (20 left + `kstayawake 15` -> 15)
-#   kstayawake off      restore normal settings now; suspend if the lid is closed
-#   kstayawake status   show whether armed and the time remaining
-#   kstayawake --help   show this help
-#
-# Notes:
-# - Suspend uses `systemctl suspend` (polkit allow_active=yes -> no password).
-# - On logout the unit is sent SIGTERM; the trap restores settings but does NOT
-#   suspend. Only an actual timeout, or explicit `off`, suspends.
-# - Test hooks: KSTAYAWAKE_DRYRUN=1 logs "would suspend" instead of suspending;
-#   KSTAYAWAKE_FORCE_LID_CLOSED=1 makes lid_closed() always true.
-#
-# v0.1.0 - basic features working
+# kstayawake — temporary wake-lock for KDE/PowerDevil. The full description and
+#              usage live in usage() just below; `kstayawake --help` prints it.
 #
 set -euo pipefail
+
+# usage() doubles as this script's documentation: it's the single source of
+# truth for both `--help` and the prose a reader sees first on opening the file.
+usage() {
+  cat <<'EOF'
+kstayawake — temporarily stop KDE/PowerDevil from sleeping on idle or lid-close
+             for N minutes, then restore normal behavior and (if the lid is
+             still shut and not docked) suspend.
+
+Why this exists: lets a long job run with the lid closed without leaving the
+machine awake forever. Entirely user-space — no sudo. It flips LidAction and
+AutoSuspendAction to 0 (NoAction) in ~/.config/powerdevilrc for the AC and
+Battery profiles, reloads PowerDevil over D-Bus, and runs the countdown in a
+transient `systemd --user` unit. The LowBattery profile is left untouched, so
+a dying unattended laptop still suspends.
+
+Usage:
+  kstayawake N        arm / re-arm: no idle+lid sleep for N minutes. Re-running
+                      resets the countdown to N (20 left + `kstayawake 15` -> 15)
+  kstayawake off      restore normal settings now; suspend if lid closed & not docked
+  kstayawake status   show whether armed and the time remaining
+  kstayawake --help   show this help
+
+Notes:
+- Suspend uses `systemctl suspend` (polkit allow_active=yes -> no password).
+- On logout the unit is sent SIGTERM; the trap restores settings but does NOT
+  suspend. Only an actual timeout, or explicit `off`, suspends.
+- Docked (external display connected) counts as "don't suspend on lid close",
+  mirroring logind's HandleLidSwitchDocked — so timeout/`off` won't sleep a
+  docked laptop just because the lid is shut.
+- Test hooks: KSTAYAWAKE_DRYRUN=1 logs "would suspend" instead of suspending;
+  KSTAYAWAKE_FORCE_LID_CLOSED=1 makes lid_closed() always true;
+  KSTAYAWAKE_FORCE_DOCKED=1/0 forces docked()/not-docked.
+
+v0.1.1 - don't suspend a docked laptop on lid close
+EOF
+}
 
 UNIT=kstayawake.service
 SELF="$(readlink -f "$0")"
@@ -148,6 +161,25 @@ lid_closed() {
   grep -qi closed /proc/acpi/button/lid/LID/state 2>/dev/null
 }
 
+docked() {
+  # True if an external display is connected, i.e. the laptop is "docked".
+  # Internal-panel connectors (eDP/LVDS/DSI) don't count. This mirrors how
+  # logind decides dockedness, which is why a normally-configured docked laptop
+  # honors HandleLidSwitchDocked=ignore and stays awake on lid-close.
+  # KSTAYAWAKE_FORCE_DOCKED=1 forces docked, =0 forces undocked (for testing).
+  case "${KSTAYAWAKE_FORCE_DOCKED:-}" in 1) return 0 ;; 0) return 1 ;; esac
+  local f name
+  for f in /sys/class/drm/*/status; do
+    [ -r "$f" ] && [ "$(cat "$f")" = connected ] || continue
+    name=${f%/status}; name=${name##*/}     # e.g. card0-HDMI-A-1
+    case "$name" in
+      *eDP*|*LVDS*|*DSI*) ;;                 # internal panel — not a dock signal
+      *) return 0 ;;                         # any external connector connected
+    esac
+  done
+  return 1
+}
+
 suspend_now() {
   if [ -n "${KSTAYAWAKE_DRYRUN:-}" ]; then
     echo "kstayawake: [dryrun] would suspend now" >&2
@@ -157,7 +189,19 @@ suspend_now() {
   systemctl suspend
 }
 
-suspend_if_closed() { if lid_closed; then suspend_now; fi; }
+# Suspend only if the lid is shut AND we're not docked. PowerDevil/logind
+# suspend on the lid-close *edge*; arming swallowed that edge, and restoring
+# settings doesn't replay it — so we trigger the suspend ourselves. But a docked
+# laptop (external display) normally ignores lid-close, so defer to that here.
+suspend_if_closed() {
+  if lid_closed; then
+    if docked; then
+      echo "kstayawake: lid closed but docked (external display) — not suspending" >&2
+    else
+      suspend_now
+    fi
+  fi
+}
 
 # --- daemon (runs inside the transient systemd --user unit) --------------------
 
@@ -171,7 +215,7 @@ daemon_loop() {
     rem=$((dl - now))
     if [ "$rem" -gt 20 ]; then sleep 15; else sleep "$rem"; fi
   done
-  # reached the deadline naturally -> restore and suspend if still closed
+  # reached the deadline naturally -> restore and suspend if closed & not docked
   do_restore
   suspend_if_closed
 }
@@ -202,7 +246,7 @@ cmd_off() {
     systemctl --user stop "$UNIT" >/dev/null 2>&1 || true
   fi
   do_restore          # no-op if the trap already restored; handles stale state
-  suspend_if_closed   # `off` mirrors timeout: suspend if the lid is shut
+  suspend_if_closed   # `off` mirrors timeout: suspend if lid shut & not docked
   echo "kstayawake: off — normal power settings restored"
 }
 
@@ -217,10 +261,6 @@ cmd_status() {
   else
     echo "kstayawake: inactive — normal power settings"
   fi
-}
-
-usage() {
-  sed -n '3,29p' "$SELF" | sed 's/^# \{0,1\}//'
 }
 
 main() {

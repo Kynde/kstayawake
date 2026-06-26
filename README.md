@@ -58,3 +58,7 @@ or other suggestions.
 
 Also I only wrote the completions for zsh, but PRs for bash/fish are welcome.
 
+## License
+
+[MIT](LICENSE)
+
