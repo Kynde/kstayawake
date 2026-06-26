@@ -57,3 +57,4 @@ be ported or adapted to other systems. Feel free to submit PRs for GNOME, macOS,
 or other suggestions.
 
 Also I only wrote the completions for zsh, but PRs for bash/fish are welcome.
+
