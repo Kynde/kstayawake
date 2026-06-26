@@ -25,6 +25,8 @@
 # - Test hooks: KSTAYAWAKE_DRYRUN=1 logs "would suspend" instead of suspending;
 #   KSTAYAWAKE_FORCE_LID_CLOSED=1 makes lid_closed() always true.
 #
+# v0.1.0 - first release
+#
 set -euo pipefail
 
 UNIT=kstayawake.service

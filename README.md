@@ -7,8 +7,10 @@
 Temporarily stop KDE/PowerDevil from sleeping on idle or lid-close for *N*
 minutes, then restore normal behavior and — if the lid is still shut — suspend.
 
-Lets a long job finish with the lid closed without leaving the machine awake
-forever. Entirely user-space: **no sudo**.
+Let's me access agents with [airc](https://github.com/Kynde/airc) when the laptop
+is stowed away in a bag or backseat.
+
+Entirely user-space: **no sudo**.
 
 ## Usage
 
@@ -67,3 +69,10 @@ Then restart zsh (or `rm -f ~/.zcompdump*; compinit`) to pick up completions.
 - `kreadconfig6` / `kwriteconfig6` (KDE Frameworks 6)
 - `qdbus-qt6`
 - `systemd` user instance
+
+Currently only supports KDE Plasma 6 (PowerDevil) on Linux, but the concept can
+be ported or adapted to other systems. Feel free to submit PRs for GNOME, macOS,
+or other suggestions.
+
+Also I only wrote the completions for zsh, but PRs for bash/fish are welcome.
+
