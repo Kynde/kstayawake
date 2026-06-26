@@ -1,0 +1,237 @@
+#!/bin/bash
+#
+# kstayawake — temporarily stop KDE/PowerDevil from sleeping on idle or lid-close
+#              for N minutes, then restore normal behavior and (if the lid is
+#              still shut) suspend.
+#
+# Why this exists: lets a long job run with the lid closed without leaving the
+# machine awake forever. Entirely user-space — no sudo. It flips LidAction and
+# AutoSuspendAction to 0 (NoAction) in ~/.config/powerdevilrc for the AC and
+# Battery profiles, reloads PowerDevil over D-Bus, and runs the countdown in a
+# transient `systemd --user` unit. The LowBattery profile is left untouched, so
+# a dying unattended laptop still suspends.
+#
+# Usage:
+#   kstayawake N        arm / re-arm: no idle+lid sleep for N minutes. Re-running
+#                       resets the countdown to N (20 left + `kstayawake 15` -> 15)
+#   kstayawake off      restore normal settings now; suspend if the lid is closed
+#   kstayawake status   show whether armed and the time remaining
+#   kstayawake --help   show this help
+#
+# Notes:
+# - Suspend uses `systemctl suspend` (polkit allow_active=yes -> no password).
+# - On logout the unit is sent SIGTERM; the trap restores settings but does NOT
+#   suspend. Only an actual timeout, or explicit `off`, suspends.
+# - Test hooks: KSTAYAWAKE_DRYRUN=1 logs "would suspend" instead of suspending;
+#   KSTAYAWAKE_FORCE_LID_CLOSED=1 makes lid_closed() always true.
+#
+set -euo pipefail
+
+UNIT=kstayawake.service
+SELF="$(readlink -f "$0")"
+STATE_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/kstayawake"
+DEADLINE_FILE="$STATE_DIR/deadline"
+SNAPSHOT_FILE="$STATE_DIR/snapshot"
+
+RC=powerdevilrc          # resolved under ~/.config by kreadconfig6/kwriteconfig6
+ABSENT=__ABSENT__        # sentinel: key not present in the file
+
+# The four settings overridden while armed, as "profile:key".
+KEYS=(
+  "AC:LidAction"
+  "AC:AutoSuspendAction"
+  "Battery:LidAction"
+  "Battery:AutoSuspendAction"
+)
+
+PM_SVC=org.kde.Solid.PowerManagement
+PM_PATH=/org/kde/Solid/PowerManagement
+LID_PATH=/org/kde/Solid/PowerManagement/Actions/HandleButtonEvents
+
+die() { echo "kstayawake: $*" >&2; exit 1; }
+
+# --- PowerDevil config helpers -------------------------------------------------
+
+read_key() { # profile key  -> value or $ABSENT
+  kreadconfig6 --file "$RC" --group "$1" --group SuspendAndShutdown \
+    --key "$2" --default "$ABSENT"
+}
+
+write_key() { # profile key value
+  kwriteconfig6 --file "$RC" --group "$1" --group SuspendAndShutdown \
+    --key "$2" --type uint "$3"
+}
+
+del_key() { # profile key
+  kwriteconfig6 --file "$RC" --group "$1" --group SuspendAndShutdown \
+    --key "$2" --delete
+}
+
+reload_pd() {
+  qdbus-qt6 "$PM_SVC" "$PM_PATH" refreshStatus >/dev/null 2>&1 || true
+}
+
+live_lid_action() { # current profile's effective lid action, or "?" on error
+  qdbus-qt6 "$PM_SVC" "$LID_PATH" lidAction 2>/dev/null || echo "?"
+}
+
+# --- snapshot / apply / restore ------------------------------------------------
+
+snapshot() { # record originals once, so restore is exact
+  : > "$SNAPSHOT_FILE"
+  local profile key val
+  for entry in "${KEYS[@]}"; do
+    profile=${entry%%:*}; key=${entry##*:}
+    val=$(read_key "$profile" "$key")
+    printf '%s:%s:%s\n' "$profile" "$key" "$val" >> "$SNAPSHOT_FILE"
+  done
+}
+
+_write_zero() { # set all four keys to NoAction
+  local profile key
+  for entry in "${KEYS[@]}"; do
+    profile=${entry%%:*}; key=${entry##*:}
+    write_key "$profile" "$key" 0
+  done
+}
+
+_write_restore() { # put each key back to its snapshotted value (or delete it)
+  local profile key val
+  while IFS=: read -r profile key val; do
+    [ -n "$profile" ] || continue
+    if [ "$val" = "$ABSENT" ]; then
+      del_key "$profile" "$key"
+    else
+      write_key "$profile" "$key" "$val"
+    fi
+  done < "$SNAPSHOT_FILE"
+}
+
+# Reload PowerDevil and confirm the live lid action settled to the wanted state,
+# re-issuing the file writes on mismatch. Guards against KConfig's mtime-grain
+# change detection missing a fast edit (PowerDevil can briefly re-persist stale
+# in-memory values). want=zero -> lid must be 0; want=nonzero -> lid must sleep.
+enforce() { # want(zero|nonzero) writer_fn
+  local want=$1 writer=$2 i live
+  for ((i = 0; i < 12; i++)); do
+    reload_pd
+    sleep 0.3
+    live=$(live_lid_action)
+    if [ "$want" = zero ]; then
+      [ "$live" = 0 ] && return 0
+    else
+      [ "$live" != 0 ] && [ "$live" != "?" ] && return 0
+    fi
+    "$writer"        # mismatch — rewrite and try again
+    sleep 0.4
+  done
+  echo "kstayawake: warning: PowerDevil lid action did not settle (live=$live)" >&2
+  return 0
+}
+
+apply_block() { _write_zero; enforce zero _write_zero; }
+
+do_restore() { # settings-only; idempotent; no suspend
+  [ -f "$SNAPSHOT_FILE" ] || return 0
+  _write_restore
+  enforce nonzero _write_restore
+  rm -f "$SNAPSHOT_FILE" "$DEADLINE_FILE"
+}
+
+# --- lid / suspend -------------------------------------------------------------
+
+lid_closed() {
+  # KSTAYAWAKE_FORCE_LID_CLOSED=1 forces "closed" for testing the suspend path.
+  [ -n "${KSTAYAWAKE_FORCE_LID_CLOSED:-}" ] && return 0
+  grep -qi closed /proc/acpi/button/lid/LID/state 2>/dev/null
+}
+
+suspend_now() {
+  if [ -n "${KSTAYAWAKE_DRYRUN:-}" ]; then
+    echo "kstayawake: [dryrun] would suspend now" >&2
+    : > "$STATE_DIR/dryrun-suspended"
+    return 0
+  fi
+  systemctl suspend
+}
+
+suspend_if_closed() { if lid_closed; then suspend_now; fi; }
+
+# --- daemon (runs inside the transient systemd --user unit) --------------------
+
+daemon_loop() {
+  trap 'do_restore; exit 0' TERM INT   # logout / `off` stop -> restore, no suspend
+  local now dl rem
+  while :; do
+    [ -f "$DEADLINE_FILE" ] || break
+    now=$(date +%s); dl=$(cat "$DEADLINE_FILE" 2>/dev/null || echo 0)
+    [ "$now" -ge "$dl" ] && break
+    rem=$((dl - now))
+    if [ "$rem" -gt 20 ]; then sleep 15; else sleep "$rem"; fi
+  done
+  # reached the deadline naturally -> restore and suspend if still closed
+  do_restore
+  suspend_if_closed
+}
+
+# --- subcommands ---------------------------------------------------------------
+
+cmd_arm() {
+  local mins=$1
+  [[ "$mins" =~ ^[0-9]+$ ]] && [ "$mins" -ge 1 ] || die "minutes must be a positive integer"
+  mkdir -p "$STATE_DIR"
+  [ -f "$SNAPSHOT_FILE" ] || snapshot   # capture originals only on first arm
+  apply_block                            # idempotent; ensures lid+idle = NoAction
+  echo $(( $(date +%s) + mins * 60 )) > "$DEADLINE_FILE"
+  if ! systemctl --user --quiet is-active "$UNIT" 2>/dev/null; then
+    systemctl --user reset-failed "$UNIT" >/dev/null 2>&1 || true
+    systemd-run --user --collect --quiet \
+      --unit="${UNIT%.service}" \
+      --description="kstayawake wake-lock countdown" \
+      --property=TimeoutStopSec=15 \
+      "$SELF" __daemon
+  fi
+  cmd_status
+}
+
+cmd_off() {
+  if systemctl --user --quiet is-active "$UNIT" 2>/dev/null; then
+    # blocks until the unit is inactive -> its trap has already run do_restore
+    systemctl --user stop "$UNIT" >/dev/null 2>&1 || true
+  fi
+  do_restore          # no-op if the trap already restored; handles stale state
+  suspend_if_closed   # `off` mirrors timeout: suspend if the lid is shut
+  echo "kstayawake: off — normal power settings restored"
+}
+
+cmd_status() {
+  if [ -f "$DEADLINE_FILE" ] && systemctl --user --quiet is-active "$UNIT" 2>/dev/null; then
+    local now dl rem
+    now=$(date +%s); dl=$(cat "$DEADLINE_FILE")
+    rem=$(( dl - now )); [ "$rem" -lt 0 ] && rem=0
+    printf 'kstayawake: ARMED — %dm%02ds remaining (idle+lid sleep off: AC+Battery)\n' \
+      $(( rem / 60 )) $(( rem % 60 ))
+    printf '            live lid action = %s (0=NoAction, 1=Sleep)\n' "$(live_lid_action)"
+  else
+    echo "kstayawake: inactive — normal power settings"
+  fi
+}
+
+usage() {
+  sed -n '3,25p' "$SELF" | sed 's/^# \{0,1\}//'
+}
+
+main() {
+  case "${1:-}" in
+    __daemon)            daemon_loop ;;
+    status|--status)     cmd_status ;;
+    off|stop)            cmd_off ;;
+    -h|--help|help|"")   usage ;;
+    *)                   cmd_arm "$1" ;;
+  esac
+}
+
+# Only dispatch when executed directly; allow `source` for testing helpers.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

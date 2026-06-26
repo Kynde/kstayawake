@@ -1,0 +1,29 @@
+#compdef kstayawake
+# zsh completion for kstayawake (bin/kstayawake in the `kstayawake` repo).
+# Keep this file in sync with the subcommands in bin/kstayawake.
+# Install: symlink into a dir on $fpath, e.g.
+#   ln -s ~/kstayawake/completions/_kstayawake ~/.zsh/completion/_kstayawake
+# then restart zsh (or: rm -f ~/.zcompdump*; compinit).
+
+_kstayawake() {
+  local -a subcmds=(
+    'off:restore normal power settings now; suspend if the lid is closed'
+    'stop:alias for off'
+    'status:show whether armed and the time remaining'
+    'help:show this help'
+  )
+  local -a opts=(
+    '--status:show whether armed and the time remaining'
+    '--help:show this help'
+    '-h:show this help'
+  )
+
+  # kstayawake takes exactly one argument; offer nothing past the first word.
+  (( CURRENT > 2 )) && return 0
+
+  _describe -t commands 'command' subcmds
+  _describe -t options 'option' opts
+  _message -e minutes 'minutes to stay awake (positive integer)'
+}
+
+_kstayawake "$@"
