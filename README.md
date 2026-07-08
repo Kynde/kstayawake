@@ -4,7 +4,7 @@
 
 # kstayawake
 
-Keep laptop away temporarily even if the lid is closed.
+Keep laptop awake temporarily even if the lid is closed.
 
 Let's me access agents with [airc](https://github.com/Kynde/airc) or let
 some number crunching complete when the laptop is stowed away in a bag or backseat.
