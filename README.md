@@ -23,6 +23,10 @@ Re-running while armed resets the countdown (`20m left + kstayawake 15` → `15m
 When the timer runs out — or on an explicit `off` — normal power settings are
 restored and, if the lid is still closed, the machine suspends.
 
+<p align="center">
+  <img src="docs/kstayawake_cli.png" alt="kstayawake">
+</p>
+
 ## How it works
 
 Entirely user-space, **no sudo**: while armed, the tool flips PowerDevil's lid
