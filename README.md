@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/kstayawake.png" alt="kstayawake" width="200">
+  <img src="docs/kstayawake_tui.png" alt="kstayawake">
 </p>
 
 # kstayawake
