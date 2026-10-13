@@ -4,6 +4,7 @@
 #              usage live in usage() just below; `kstayawake --help` prints it.
 #
 set -euo pipefail
+shopt -s extglob    # center() strips ANSI escapes with an extglob pattern
 
 # usage() doubles as this script's documentation: it's the single source of
 # truth for both `--help` and the prose a reader sees first on opening the file.
@@ -24,7 +25,10 @@ Usage:
   kstayawake N        arm / re-arm: no idle+lid sleep for N minutes. Re-running
                       resets the countdown to N (20 left + `kstayawake 15` -> 15)
   kstayawake off      restore normal settings now; suspend if lid closed & not docked
-  kstayawake status   show whether armed and the time remaining
+  kstayawake status   show whether armed and the time remaining (the default
+                      when run with no arguments)
+  kstayawake tui      live full-screen countdown, refreshed every second
+                      (q / Esc / Ctrl-C to quit)
   kstayawake --help   show this help
 
 Notes:
@@ -34,11 +38,12 @@ Notes:
 - Docked (external display connected) counts as "don't suspend on lid close",
   mirroring logind's HandleLidSwitchDocked — so timeout/`off` won't sleep a
   docked laptop just because the lid is shut.
+- Colors are used only when stdout is a terminal; NO_COLOR=1 turns them off.
 - Test hooks: KSTAYAWAKE_DRYRUN=1 logs "would suspend" instead of suspending;
   KSTAYAWAKE_FORCE_LID_CLOSED=1 makes lid_closed() always true;
   KSTAYAWAKE_FORCE_DOCKED=1/0 forces docked()/not-docked.
 
-v0.1.1 - don't suspend a docked laptop on lid close
+v0.2.0 - default to status; colored status; `tui` live countdown
 EOF
 }
 
@@ -46,6 +51,7 @@ UNIT=kstayawake.service
 SELF="$(readlink -f "$0")"
 STATE_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/kstayawake"
 DEADLINE_FILE="$STATE_DIR/deadline"
+TOTAL_FILE="$STATE_DIR/total"        # seconds armed for, for the progress bar
 SNAPSHOT_FILE="$STATE_DIR/snapshot"
 
 RC=powerdevilrc          # resolved under ~/.config by kreadconfig6/kwriteconfig6
@@ -150,7 +156,7 @@ do_restore() { # settings-only; idempotent; no suspend
   [ -f "$SNAPSHOT_FILE" ] || return 0
   _write_restore
   enforce nonzero _write_restore
-  rm -f "$SNAPSHOT_FILE" "$DEADLINE_FILE"
+  rm -f "$SNAPSHOT_FILE" "$DEADLINE_FILE" "$TOTAL_FILE"
 }
 
 # --- lid / suspend -------------------------------------------------------------
@@ -228,6 +234,7 @@ cmd_arm() {
   mkdir -p "$STATE_DIR"
   [ -f "$SNAPSHOT_FILE" ] || snapshot   # capture originals only on first arm
   apply_block                            # idempotent; ensures lid+idle = NoAction
+  echo $(( mins * 60 )) > "$TOTAL_FILE"
   echo $(( $(date +%s) + mins * 60 )) > "$DEADLINE_FILE"
   if ! systemctl --user --quiet is-active "$UNIT" 2>/dev/null; then
     systemctl --user reset-failed "$UNIT" >/dev/null 2>&1 || true
@@ -250,25 +257,215 @@ cmd_off() {
   echo "kstayawake: off — normal power settings restored"
 }
 
-cmd_status() {
-  if [ -f "$DEADLINE_FILE" ] && systemctl --user --quiet is-active "$UNIT" 2>/dev/null; then
-    local now dl rem
-    now=$(date +%s); dl=$(cat "$DEADLINE_FILE")
-    rem=$(( dl - now )); [ "$rem" -lt 0 ] && rem=0
-    printf 'kstayawake: ARMED — %dm%02ds remaining (idle+lid sleep off: AC+Battery)\n' \
-      $(( rem / 60 )) $(( rem % 60 ))
-    printf '            live lid action = %s (0=NoAction, 1=Sleep)\n' "$(live_lid_action)"
+# --- display helpers -----------------------------------------------------------
+
+setup_colors() { # C_* escapes; empty unless stdout is a terminal and NO_COLOR unset
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RST=$'\e[0m' C_BOLD=$'\e[1m' C_DIM=$'\e[2m'
+    C_RED=$'\e[31m' C_GREEN=$'\e[32m' C_YELLOW=$'\e[33m' C_CYAN=$'\e[36m'
   else
-    echo "kstayawake: inactive — normal power settings"
+    C_RST='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW='' C_CYAN=''
   fi
+}
+
+is_armed() {
+  [ -f "$DEADLINE_FILE" ] && systemctl --user --quiet is-active "$UNIT" 2>/dev/null
+}
+
+remaining() { # seconds left on the countdown, >= 0
+  local dl rem
+  dl=$(cat "$DEADLINE_FILE" 2>/dev/null || echo 0)
+  rem=$(( dl - EPOCHSECONDS ))
+  echo $(( rem < 0 ? 0 : rem ))
+}
+
+fmt_dur() { # seconds -> 1h05m03s / 12m03s
+  local s=$1
+  if [ "$s" -ge 3600 ]; then
+    printf '%dh%02dm%02ds' $(( s / 3600 )) $(( s % 3600 / 60 )) $(( s % 60 ))
+  else
+    printf '%dm%02ds' $(( s / 60 )) $(( s % 60 ))
+  fi
+}
+
+urgency_color() { # seconds left -> green (>5m), yellow (>1m), red
+  if   [ "$1" -gt 300 ]; then echo "$C_GREEN"
+  elif [ "$1" -gt 60 ];  then echo "$C_YELLOW"
+  else                        echo "$C_RED"
+  fi
+}
+
+progress_bar() { # width rem total color -> lit part = fraction remaining
+  local w=$1 rem=$2 total=$3 col=$4 n lit dim
+  n=$(( (rem * w + total - 1) / total )); [ "$n" -gt "$w" ] && n=$w
+  printf -v lit '%*s' "$n" '';          lit=${lit// /━}
+  printf -v dim '%*s' $(( w - n )) '';  dim=${dim// /─}
+  printf '%s%s%s%s%s' "$col" "$lit" "$C_DIM" "$dim" "$C_RST"
+}
+
+power_state() { # "AC 87%" / "battery 23%"
+  local f online='' cap=''
+  for f in /sys/class/power_supply/*; do
+    case "$(cat "$f/type" 2>/dev/null)" in
+      Mains)   [ "$(cat "$f/online" 2>/dev/null)" = 1 ] && online=1 ;;
+      Battery) cap=$(cat "$f/capacity" 2>/dev/null || true) ;;
+    esac
+  done
+  if [ -n "$online" ]; then echo "AC${cap:+ $cap%}"; else echo "battery${cap:+ $cap%}"; fi
+}
+
+lid_action_name() { # PowerDevil action enum -> name
+  case "$1" in
+    0) echo NoAction ;;  1) echo Sleep ;;     2) echo Hibernate ;;
+    8) echo Shutdown ;; 32) echo LockScreen ;; 64) echo TurnOffScreen ;;
+    *) echo "action $1" ;;
+  esac
+}
+
+context_line() { # lid / power / dock / live lid action, labels dimmed
+  local live col
+  live=$(live_lid_action)
+  if [ "$live" = 0 ]; then col=$C_GREEN; else col=$C_CYAN; fi
+  printf '%slid%s %s   %spower%s %s   %sdocked%s %s   %slid action%s %s%s (%s)%s' \
+    "$C_DIM" "$C_RST" "$(lid_closed && echo closed || echo open)" \
+    "$C_DIM" "$C_RST" "$(power_state)" \
+    "$C_DIM" "$C_RST" "$(docked && echo yes || echo no)" \
+    "$C_DIM" "$C_RST" "$col" "$(lid_action_name "$live")" "$live" "$C_RST"
+}
+
+cmd_status() {
+  setup_colors
+  if is_armed; then
+    local rem total col until
+    rem=$(remaining); total=$(cat "$TOTAL_FILE" 2>/dev/null || echo 0)
+    col=$(urgency_color "$rem")
+    printf -v until '%(%H:%M)T' "$(cat "$DEADLINE_FILE")"
+    printf '%skstayawake%s  %s● ARMED%s  %s%s%s left  %s· until %s · idle+lid sleep off (AC+Battery)%s\n' \
+      "$C_BOLD" "$C_RST" "$C_BOLD$col" "$C_RST" "$C_BOLD" "$(fmt_dur "$rem")" "$C_RST" \
+      "$C_DIM" "$until" "$C_RST"
+    if [ "$total" -gt 0 ]; then
+      printf '  %s %s%3d%%%s\n' "$(progress_bar 40 "$rem" "$total" "$col")" \
+        "$C_DIM" $(( rem * 100 / total )) "$C_RST"
+    fi
+    printf '  %s\n' "$(context_line)"
+  else
+    printf '%skstayawake%s  %s○ inactive%s  %s— normal power settings%s\n' \
+      "$C_BOLD" "$C_RST" "$C_DIM" "$C_RST" "$C_DIM" "$C_RST"
+    printf '  %s\n' "$(context_line)"
+  fi
+}
+
+# --- tui -----------------------------------------------------------------------
+
+# Big-digit font: 3x5 glyphs, rows split by '|', '#' = lit pixel (2 cells wide).
+declare -A FONT=(
+  [0]='###|# #|# #|# #|###'  [1]=' # |## | # | # |###'  [2]='###|  #|###|#  |###'
+  [3]='###|  #|###|  #|###'  [4]='# #|# #|###|  #|  #'  [5]='###|#  |###|  #|###'
+  [6]='###|#  |###|# #|###'  [7]='###|  #| # | # | # '  [8]='###|# #|###|# #|###'
+  [9]='###|# #|###|  #|###'  [-]='   |   |###|   |   '  [:]=' |#| |#| '
+)
+
+big_text() { # text -> BIG[0..4], glyphs separated by a 1-pixel gap
+  local text=$1 i r rows
+  BIG=('' '' '' '' '')
+  for (( i = 0; i < ${#text}; i++ )); do
+    IFS='|' read -ra rows <<< "${FONT[${text:i:1}]}"
+    for r in 0 1 2 3 4; do
+      (( i > 0 )) && BIG[r]+=' '
+      BIG[r]+=${rows[r]}
+    done
+  done
+  for r in 0 1 2 3 4; do
+    BIG[r]=${BIG[r]// /  }; BIG[r]=${BIG[r]//#/██}
+  done
+}
+
+center() { # text -> left-padded so its visible part is centered in TUI_COLS
+  local plain=${1//$'\e'\[*([0-9;])m/} pad
+  pad=$(( (TUI_COLS - ${#plain}) / 2 )); [ "$pad" -lt 0 ] && pad=0
+  printf '%*s%s' "$pad" '' "$1"
+}
+
+tui_frame() { # draw one full frame in place
+  local lines=() rem total col until digits bw r top out='' line
+  read -r TUI_ROWS TUI_COLS < <(stty size </dev/tty)
+
+  if is_armed; then
+    rem=$(remaining); total=$(cat "$TOTAL_FILE" 2>/dev/null || echo 0)
+    col=$(urgency_color "$rem")
+    printf -v until '%(%H:%M:%S)T' "$(cat "$DEADLINE_FILE")"
+    if [ "$rem" -ge 3600 ]; then
+      printf -v digits '%d:%02d:%02d' $(( rem / 3600 )) $(( rem % 3600 / 60 )) $(( rem % 60 ))
+    else
+      printf -v digits '%02d:%02d' $(( rem / 60 )) $(( rem % 60 ))
+    fi
+    lines+=("${C_BOLD}kstayawake${C_RST}  ${C_BOLD}${col}● ARMED${C_RST}" '')
+  else
+    col=$C_DIM; digits='--:--'
+    lines+=("${C_BOLD}kstayawake${C_RST}  ${C_DIM}○ inactive${C_RST}" '')
+  fi
+
+  big_text "$digits"
+  if [ "${#BIG[0]}" -le "$TUI_COLS" ]; then
+    for r in 0 1 2 3 4; do lines+=("$col${BIG[r]}$C_RST"); done
+  else
+    lines+=("$C_BOLD$col$digits$C_RST")      # too narrow for big digits
+  fi
+  lines+=('')
+
+  if is_armed; then
+    lines+=("${C_DIM}remaining · normal sleep returns at ${C_RST}${until}")
+    if [ "$total" -gt 0 ]; then
+      bw=$(( TUI_COLS - 12 )); [ "$bw" -gt 48 ] && bw=48; [ "$bw" -lt 10 ] && bw=10
+      lines+=('' "$(progress_bar "$bw" "$rem" "$total" "$col") ${C_DIM}$(( rem * 100 / total ))%${C_RST}")
+    fi
+  else
+    lines+=("${C_DIM}normal power settings · arm with ${C_RST}kstayawake N")
+  fi
+  lines+=('' "$(context_line)" '' "${C_DIM}q to quit${C_RST}")
+
+  top=$(( (TUI_ROWS - ${#lines[@]}) / 2 )); [ "$top" -lt 0 ] && top=0
+  for (( r = 0; r < top; r++ )); do out+=$'\e[K\n'; done
+  for line in "${lines[@]}"; do out+="$(center "$line")"$'\e[K\n'; done
+  printf '\e[H%s\e[J' "${out%$'\n'}"
+}
+
+tui_cleanup() { printf '\e[0m\e[?25h\e[?1049l'; stty "$TUI_STTY" 2>/dev/null || true; }
+
+cmd_tui() {
+  [ -t 0 ] && [ -t 1 ] || die "tui needs a terminal"
+  setup_colors
+  TUI_STTY=$(stty -g)
+  trap tui_cleanup EXIT
+  trap 'exit 0' INT TERM
+  stty -echo -icanon
+  printf '\e[?1049h\e[?25l'               # alternate screen, hide cursor
+
+  local key rest t us
+  while :; do
+    tui_frame
+    # sleep until just past the next whole second, so the countdown ticks evenly
+    t=${EPOCHREALTIME/[.,]/}
+    us=$(( 1000000 - 10#${t: -6} + 20000 ))
+    printf -v t '%d.%06d' $(( us / 1000000 )) $(( us % 1000000 ))
+    key=''
+    IFS= read -rsn1 -t "$t" key || true
+    case "$key" in
+      q|Q) break ;;
+      $'\e')                               # bare Esc quits; arrow keys etc. don't
+        rest=''; IFS= read -rsn2 -t 0.02 rest || true
+        [ -z "$rest" ] && break ;;
+    esac
+  done
 }
 
 main() {
   case "${1:-}" in
     __daemon)            daemon_loop ;;
-    status|--status)     cmd_status ;;
+    status|--status|"")  cmd_status ;;
+    tui)                 cmd_tui ;;
     off|stop)            cmd_off ;;
-    -h|--help|help|"")   usage ;;
+    -h|--help|help)      usage ;;
     *)                   cmd_arm "$1" ;;
   esac
 }

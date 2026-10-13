@@ -9,7 +9,8 @@ _kstayawake() {
   local -a subcmds=(
     'off:restore normal power settings now; suspend if the lid is closed'
     'stop:alias for off'
-    'status:show whether armed and the time remaining'
+    'status:show whether armed and the time remaining (default)'
+    'tui:live full-screen countdown'
     'help:show this help'
   )
   local -a opts=(

@@ -14,7 +14,8 @@ some number crunching complete when the laptop is stowed away in a bag or backse
 ```
 kstayawake N        no sleep for N minutes
 kstayawake off      restore to normal settings now
-kstayawake status   show whether armed and the time remaining
+kstayawake status   show whether armed and the time remaining (default)
+kstayawake tui      live full-screen countdown (q to quit)
 kstayawake --help   show this help
 ```
 

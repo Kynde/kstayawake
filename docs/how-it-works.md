@@ -76,6 +76,7 @@ All transient state lives under `$XDG_RUNTIME_DIR/kstayawake/` (tmpfs, cleared
 on logout):
 
 - `deadline` — Unix timestamp the countdown is counting down to.
+- `total` — the armed duration in seconds, used for the progress bar.
 - `snapshot` — the original values of the four keys, captured on first arm.
 
 ## Test hooks
