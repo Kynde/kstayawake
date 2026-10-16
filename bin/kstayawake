@@ -29,6 +29,8 @@ Usage:
                       when run with no arguments)
   kstayawake tui      live full-screen countdown, refreshed every second
                       (q / Esc / Ctrl-C to quit)
+  kstayawake tui N    arm / re-arm for N minutes, then open the tui
+                      (`kstayawake N tui` works too)
   kstayawake --help   show this help
 
 Notes:
@@ -43,7 +45,7 @@ Notes:
   KSTAYAWAKE_FORCE_LID_CLOSED=1 makes lid_closed() always true;
   KSTAYAWAKE_FORCE_DOCKED=1/0 forces docked()/not-docked.
 
-v0.2.0 - default to status; colored status; `tui` live countdown
+v0.2.1 - `tui N` arms and opens the live countdown in one go
 EOF
 }
 
@@ -228,9 +230,11 @@ daemon_loop() {
 
 # --- subcommands ---------------------------------------------------------------
 
-cmd_arm() {
+valid_mins() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ]; }
+
+cmd_arm() { # mins [quiet] — quiet skips the closing status (tui draws its own)
   local mins=$1
-  [[ "$mins" =~ ^[0-9]+$ ]] && [ "$mins" -ge 1 ] || die "minutes must be a positive integer"
+  valid_mins "$mins" || die "minutes must be a positive integer"
   mkdir -p "$STATE_DIR"
   [ -f "$SNAPSHOT_FILE" ] || snapshot   # capture originals only on first arm
   apply_block                            # idempotent; ensures lid+idle = NoAction
@@ -244,7 +248,7 @@ cmd_arm() {
       --property=TimeoutStopSec=15 \
       "$SELF" __daemon
   fi
-  cmd_status
+  [ -n "${2:-}" ] || cmd_status
 }
 
 cmd_off() {
@@ -432,8 +436,12 @@ tui_frame() { # draw one full frame in place
 
 tui_cleanup() { printf '\e[0m\e[?25h\e[?1049l'; stty "$TUI_STTY" 2>/dev/null || true; }
 
-cmd_tui() {
+cmd_tui() { # [mins] — arm first if given
   [ -t 0 ] && [ -t 1 ] || die "tui needs a terminal"
+  if [ -n "${1:-}" ]; then
+    valid_mins "$1" || die "minutes must be a positive integer"
+    cmd_arm "$1" quiet
+  fi
   setup_colors
   TUI_STTY=$(stty -g)
   trap tui_cleanup EXIT
@@ -460,10 +468,12 @@ cmd_tui() {
 }
 
 main() {
+  # `N tui` is the same as `tui N`
+  if [ "${2:-}" = tui ] && [ $# -eq 2 ]; then set -- tui "$1"; fi
   case "${1:-}" in
     __daemon)            daemon_loop ;;
     status|--status|"")  cmd_status ;;
-    tui)                 cmd_tui ;;
+    tui)                 cmd_tui "${2:-}" ;;
     off|stop)            cmd_off ;;
     -h|--help|help)      usage ;;
     *)                   cmd_arm "$1" ;;

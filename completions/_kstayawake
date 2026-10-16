@@ -10,7 +10,7 @@ _kstayawake() {
     'off:restore normal power settings now; suspend if the lid is closed'
     'stop:alias for off'
     'status:show whether armed and the time remaining (default)'
-    'tui:live full-screen countdown'
+    'tui:live full-screen countdown (optionally: tui N to arm first)'
     'help:show this help'
   )
   local -a opts=(
@@ -19,8 +19,16 @@ _kstayawake() {
     '-h:show this help'
   )
 
-  # kstayawake takes exactly one argument; offer nothing past the first word.
-  (( CURRENT > 2 )) && return 0
+  # At most two words: `tui N` or `N tui`; offer nothing past the second.
+  (( CURRENT > 3 )) && return 0
+  if (( CURRENT == 3 )); then
+    case $words[2] in
+      tui)      _message -e minutes 'minutes to stay awake, then open the tui' ;;
+      <1->)     local -a after=('tui:open the live countdown after arming')
+                _describe -t commands 'command' after ;;
+    esac
+    return 0
+  fi
 
   _describe -t commands 'command' subcmds
   _describe -t options 'option' opts

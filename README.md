@@ -16,6 +16,7 @@ kstayawake N        no sleep for N minutes
 kstayawake off      restore to normal settings now
 kstayawake status   show whether armed and the time remaining (default)
 kstayawake tui      live full-screen countdown (q to quit)
+kstayawake tui N    arm for N minutes and open the tui (or: kstayawake N tui)
 kstayawake --help   show this help
 ```
 
